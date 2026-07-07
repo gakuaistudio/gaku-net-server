@@ -1,0 +1,13 @@
+{
+  "name": "gaku-net-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GAKU GAMES 対戦中継サーバー（依存パッケージなし・Node標準のみ）",
+  "main": "gaku-net-server.js",
+  "scripts": {
+    "start": "node gaku-net-server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

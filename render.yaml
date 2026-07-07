@@ -1,0 +1,9 @@
+# Render Blueprint（「New +」→「Blueprint」でこのファイルを使うと自動設定される）。
+# ダッシュボードで手動設定する場合はこのファイルは無視してよい（DEPLOY.md参照）。
+services:
+  - type: web
+    name: gaku-net-server
+    runtime: node
+    plan: free
+    buildCommand: ""
+    startCommand: "node gaku-net-server.js"
