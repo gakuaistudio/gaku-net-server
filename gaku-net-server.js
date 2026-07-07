@@ -11,13 +11,21 @@
  *   GET  /api/events?client&gameId&name … SSEチャンネル（イベント受信用・1クライアント1本）
  *   POST /api/create {client, gameId, maxPlayers}
  *   POST /api/join   {client, code}
- *   POST /api/random {client, size}      … size人そろったら自動でルーム成立
+ *   POST /api/random {client, size}      … size人そろったら自動でルーム成立（自動では開始しない。待機ロビーに入るだけ）
  *   POST /api/random-cancel {client}
+ *   POST /api/ready  {client, ready}     … 自分の準備完了⇔待機を切替（ホスト以外）
+ *   POST /api/start-game {client}        … ホストが開始を宣言。ホスト以外が全員準備完了でないと拒否
  *   POST /api/send   {client, payload, to?} … ルーム内の他メンバーへ中継
  *   POST /api/leave  {client}
  *
+ * ルームのライフサイクル:
+ *   作成/参加/マッチ成立 → 全員が待機ロビー（まだ"started"ではない） → ホストが/api/start-gameに成功
+ *   → started=true。開始前にホストが抜けたら次のメンバーへhostIdを引き継いでルーム継続、
+ *   開始後にホストが抜けたら（進行役がいなくなるため）ルームを閉じる。
+ *
  * SSEイベント（data: JSON）:
  *   {t:"hello"} / {t:"room", room} / {t:"match", code} / {t:"msg", from, payload} / {t:"closed", reason}
+ *   room = {code, hostId, maxPlayers, isRandom, started, members:[{id, name, ready}]}
  * ========================================================================= */
 
 const http = require("http");
@@ -26,7 +34,7 @@ const PORT = process.env.PORT || 8787;
 
 /** @type {Map<string, {res:any, gameId:string, name:string, roomCode:string|null, queueKey:string|null, dropTimer:any}>} */
 const clients = new Map();
-/** @type {Map<string, {gameId:string, hostId:string, memberIds:string[], maxPlayers:number, isRandom:boolean, created:number}>} */
+/** @type {Map<string, {gameId:string, hostId:string, memberIds:string[], maxPlayers:number, isRandom:boolean, started:boolean, ready:Set<string>, created:number}>} */
 const rooms = new Map();
 /** @type {Map<string, string[]>} キー=gameId:size → 待機中クライアントID */
 const queues = new Map();
@@ -57,7 +65,8 @@ function roomInfo(code) {
     hostId: r.hostId,
     maxPlayers: r.maxPlayers,
     isRandom: r.isRandom,
-    members: r.memberIds.map((id) => ({ id, name: (clients.get(id) || {}).name || "?" })),
+    started: !!r.started,
+    members: r.memberIds.map((id) => ({ id, name: (clients.get(id) || {}).name || "?", ready: r.ready.has(id) })),
   };
 }
 
@@ -79,7 +88,10 @@ function dequeue(clientId) {
   c.queueKey = null;
 }
 
-/** ルームから抜ける。ホストが抜けたらルームを閉じて全員に通知 */
+/** ルームから抜ける。
+ *  開始前にホストが抜けた場合は次のメンバーへhostIdを引き継いでルームを継続する
+ *  （待機ロビーでの「最初の人が抜けたら次点の人に開始の決定権が移る」仕様）。
+ *  開始後にホストが抜けた場合は進行役がいなくなるためルームを閉じる（従来通り）。 */
 function leaveRoom(clientId, reason) {
   const c = clients.get(clientId);
   if (!c || !c.roomCode) return;
@@ -88,16 +100,25 @@ function leaveRoom(clientId, reason) {
   c.roomCode = null;
   if (!r) return;
   r.memberIds = r.memberIds.filter((id) => id !== clientId);
-  if (clientId === r.hostId || r.memberIds.length === 0) {
+  r.ready.delete(clientId);
+  if (r.memberIds.length === 0) {
+    rooms.delete(code);
+    return;
+  }
+  const wasHost = clientId === r.hostId;
+  if (wasHost && r.started) {
     for (const id of r.memberIds) {
       const m = clients.get(id);
       if (m) m.roomCode = null;
       sse(id, { t: "closed", reason: reason || "host-left" });
     }
     rooms.delete(code);
-  } else {
-    pushRoom(code);
+    return;
   }
+  if (wasHost) {
+    r.hostId = r.memberIds[0]; // 次に古くから参加しているメンバーへ引き継ぐ
+  }
+  pushRoom(code);
 }
 
 /** 完全切断（SSEも閉じた） */
@@ -212,7 +233,7 @@ const server = http.createServer(async (req, res) => {
     leaveRoom(clientId, "left");
     const code = genCode();
     const maxPlayers = Math.min(8, Math.max(2, +body.maxPlayers || 2));
-    rooms.set(code, { gameId: c.gameId, hostId: clientId, memberIds: [clientId], maxPlayers, isRandom: false, created: Date.now() });
+    rooms.set(code, { gameId: c.gameId, hostId: clientId, memberIds: [clientId], maxPlayers, isRandom: false, started: false, ready: new Set(), created: Date.now() });
     c.roomCode = code;
     pushRoom(code);
     json(res, 200, { room: roomInfo(code) });
@@ -250,7 +271,7 @@ const server = http.createServer(async (req, res) => {
     if (q.length >= size) {
       const ids = q.splice(0, size);
       const code = genCode();
-      rooms.set(code, { gameId: c.gameId, hostId: ids[0], memberIds: ids.slice(), maxPlayers: size, isRandom: true, created: Date.now() });
+      rooms.set(code, { gameId: c.gameId, hostId: ids[0], memberIds: ids.slice(), maxPlayers: size, isRandom: true, started: false, ready: new Set(), created: Date.now() });
       for (const id of ids) {
         const m = clients.get(id);
         if (m) { m.roomCode = code; m.queueKey = null; }
@@ -264,6 +285,33 @@ const server = http.createServer(async (req, res) => {
 
   if (path === "/api/random-cancel") {
     dequeue(clientId);
+    json(res, 200, { ok: true });
+    return;
+  }
+
+  // ---- 準備完了⇔待機の切替（ホスト以外） ----
+  if (path === "/api/ready") {
+    const code = c.roomCode;
+    const r = code && rooms.get(code);
+    if (!r) { json(res, 400, { error: "ルームに入っていません" }); return; }
+    if (clientId === r.hostId) { json(res, 400, { error: "ホストは準備完了の対象ではありません" }); return; }
+    if (body.ready) r.ready.add(clientId); else r.ready.delete(clientId);
+    pushRoom(code);
+    json(res, 200, { ok: true });
+    return;
+  }
+
+  // ---- ホストがゲーム開始を宣言（ホスト以外が全員準備完了でないと拒否） ----
+  if (path === "/api/start-game") {
+    const code = c.roomCode;
+    const r = code && rooms.get(code);
+    if (!r) { json(res, 400, { error: "ルームに入っていません" }); return; }
+    if (clientId !== r.hostId) { json(res, 400, { error: "ホストだけが開始できます" }); return; }
+    const others = r.memberIds.filter((id) => id !== r.hostId);
+    if (others.length === 0) { json(res, 400, { error: "ほかのプレイヤーがいません" }); return; }
+    if (!others.every((id) => r.ready.has(id))) { json(res, 400, { error: "まだ準備できていない人がいます" }); return; }
+    r.started = true;
+    pushRoom(code);
     json(res, 200, { ok: true });
     return;
   }
